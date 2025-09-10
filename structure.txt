@@ -1,0 +1,57 @@
+retro-incrementality/
+├── src/
+│   └── ri/
+│       ├── __init__.py
+│       ├── get_data/
+│       │   ├── __init__.py
+│       │   ├── transactions_pipeline.py
+│       │   └── media/
+│       │       ├── __init__.py
+│       │       ├── parse_media_table.py
+│       │       └── build_weekly_store_calendar.py
+│       ├── utils/
+│       │   ├── __init__.py
+│       │   └── dates.py
+│       ├── model/
+│       │   ├── __init__.py
+│       │   ├── structures.py
+│       │   ├── forecasting/
+│       │   │   ├── __init__.py
+│       │   │   ├── aggregate_nodes.py
+│       │   │   ├── forecasters.py
+│       │   │   └── cohort_forecasting.py
+│       │   ├── reconciliation/
+│       │   │   ├── __init__.py
+│       │   │   └── non_overshoot.py
+│       │   └── orchestration/
+│       │       ├── __init__.py
+│       │       └── build_grids_v3.py
+│       └── insights/
+│           ├── __init__.py
+│           ├── exposure_calendar.py
+│           ├── sov_esov.py
+│           ├── market_share.py
+│           ├── discount_depth.py
+│           └── weekly_join.py
+├── 1_get_data/
+│   ├── README.md
+│   └── run_build_master.py
+├── 2_model/
+│   ├── README.md
+│   └── run_counterfactuals.py
+├── 3_insights/
+│   ├── README.md
+│   └── run_insights.py
+├── configs/
+│   ├── project.yaml
+│   ├── media_types_weights.yaml
+│   └── features.yaml
+├── 4_outputs/
+│   ├── artifacts/
+│   └── reports/
+├── data_samples/
+│   ├── metrics_and_granularities.csv
+│   └── media_campaign_table.csv
+├── README.md
+├── requirements.txt
+└── pyproject.toml

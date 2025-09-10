@@ -1,0 +1,7 @@
+pandas
+numpy
+xgboost
+prophet
+google-cloud-bigquery
+pyyaml
+pyarrow
