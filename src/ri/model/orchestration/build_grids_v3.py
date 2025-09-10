@@ -8,7 +8,7 @@ from src.ri.model.reconciliation.non_overshoot import enforce_non_overshoot_grid
 
 def _make_registry(promo_skus: List[str], dim_df: pd.DataFrame) -> Dict[str, List[NodeSpec]]:
     # Create NodeSpec lists for sku, brand_category, brand_subcategory, brand, category, subcategory
-    from ri.model.structures import NodeSpec
+    from src.ri.model.structures import NodeSpec
     d = dim_df[dim_df["product_id"].astype(str).isin(set(map(str, promo_skus)))]
     brands = sorted(d["brand"].dropna().unique())
     cats   = sorted(d["category"].dropna().unique())
@@ -77,7 +77,7 @@ def build_grids_for_campaigns_v3(
         train_end   = media_start - pd.Timedelta(days=1)
 
         # SKUs union
-        from ri.get_data.media.parse_media_table import to_list_flexible
+        from src.ri.get_data.media.parse_media_table import to_list_flexible
         promo_skus = sorted(set(s for row in m["sorted_sku_list"].dropna() for s in to_list_flexible(row)))
         if not promo_skus:
             continue

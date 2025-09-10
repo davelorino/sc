@@ -133,8 +133,8 @@ def fit_models_for_metric_grain(
     # seasonality placeholders (0); you can decorate with woy_sin/cos if you prefer
     weekly_df["woy_sin"] = 0.0; weekly_df["woy_cos"] = 0.0
 
-    from ri.insights.modeling.weekly_within_campaign import fit_weekly_within_campaign_model
-    from ri.insights.modeling.campaign_level import fit_campaign_level_model
+    from src.ri.insights.modeling.weekly_within_campaign import fit_weekly_within_campaign_model
+    from src.ri.insights.modeling.campaign_level import fit_campaign_level_model
 
     pipe, coef_weekly = fit_weekly_within_campaign_model(weekly_df, alpha=10.0)
     model, coef_campaign, camp_agg = fit_campaign_level_model(weekly_df, alpha=None)

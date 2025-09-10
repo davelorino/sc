@@ -13,7 +13,7 @@ except Exception:
 
 # Your helpers
 from src.ri.get_data.media.parse_media_table import to_list_flexible
-from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope
+from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope, get_transaction_data_by_scope_fast
 from src.ri.get_data.media.build_weekly_store_calendar import (
     build_weekly_store_calendar_for_campaign,
     weeks_to_store_sets,
@@ -90,8 +90,111 @@ def _date_window(media_one: pd.DataFrame, lookback_weeks: int = 104, pad_weeks: 
     max_d = (max_end   + pd.Timedelta(weeks=pad_weeks)).to_period("W-WED").start_time
     return min_d, max_d
 
-# -------- BQ on-demand fetch (recommended) --------
 
+
+def _sanitize_ids(values: List[str], type_: str, name: str) -> List[str]:
+    out = []
+    for v in values:
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s:
+            continue
+        # optional: allow only digits for product_numbers, but article_id may be alphanumeric
+        out.append(s if type_ == "STRING" else str(int(s)))  # coerce stores to digits if desired
+    # de-dupe while preserving order
+    seen = set()
+    deduped = []
+    for s in out:
+        if s in seen:
+            continue
+        seen.add(s)
+        deduped.append(s)
+    return deduped
+
+def preflight_scope(
+    client: bigquery.Client,
+    base_table_fq: str,
+    sku_list: List[str],
+    store_list: List[str],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    log_dir: str = "preflight_logs",
+    print_full: bool = True,
+) -> Tuple[List[str], List[str], List[str]]:
+    os.makedirs(log_dir, exist_ok=True)
+    tstamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # 1) Sanitize lists
+    skus = _sanitize_ids(sku_list, "STRING", "sku_ids")
+    stores = _sanitize_ids(store_list, "INT64",  "store_ids")  # change to STRING if your store_id is string in BQ
+
+    # 2) Get brands implied by base for these (skus × stores × dates)
+    sql_brands = f"""
+    DECLARE min_d DATE DEFAULT @min_d;
+    DECLARE max_d DATE DEFAULT @max_d;
+    WITH skus AS (
+      SELECT DISTINCT id
+      FROM UNNEST(@sku_ids) id
+      WHERE id IS NOT NULL AND TRIM(id) <> ''
+    ),
+    stores AS (
+      SELECT DISTINCT CAST(id AS STRING) AS id
+      FROM UNNEST(@store_ids) id
+      WHERE id IS NOT NULL AND TRIM(CAST(id AS STRING)) <> ''
+    )
+    SELECT DISTINCT BrandDescription
+    FROM `{base_table_fq}`
+    WHERE week_start BETWEEN min_d AND max_d
+      AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
+      AND CAST(store_id  AS STRING)  IN (SELECT id FROM stores)
+      AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
+    ORDER BY BrandDescription
+    """
+    job = client.query(
+        sql_brands,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("sku_ids", "STRING", skus),
+                bigquery.ArrayQueryParameter("store_ids", "STRING", stores), # casted to STRING above
+                bigquery.ScalarQueryParameter("min_d", "DATE", pd.to_datetime(start_date).date()),
+                bigquery.ScalarQueryParameter("max_d", "DATE", pd.to_datetime(end_date).date()),
+            ]
+        ),
+    )
+    brands = job.result().to_dataframe()["BrandDescription"].astype(str).tolist()
+
+    # 3) Print / log
+    print(f"[Preflight] SKUs ({len(skus)}):")
+    if print_full or len(skus) <= 200:
+        print(skus)
+    else:
+        print(skus[:200], f"...(+{len(skus)-200} more)")
+
+    print(f"[Preflight] Stores ({len(stores)}):")
+    if print_full or len(stores) <= 200:
+        print(stores)
+    else:
+        print(stores[:200], f"...(+{len(stores)-200} more)")
+
+    print(f"[Preflight] Brands ({len(brands)}):")
+    if print_full or len(brands) <= 200:
+        print(brands)
+    else:
+        print(brands[:200], f"...(+{len(brands)-200} more)")
+
+    # Also persist to disk for forensic debugging
+    with open(os.path.join(log_dir, f"scope_{tstamp}.json"), "w") as f:
+        json.dump({"skus": skus, "stores": stores, "brands": brands}, f, indent=2)
+
+    # 4) Optional: Dry-run bytes on the main query (replace with your actual SQL builder)
+    # cfg = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False, query_parameters=[...])
+    # job = client.query(main_sql, job_config=cfg)
+    # print(f"[Preflight] Estimated bytes processed: {job.total_bytes_processed:,}")
+
+    return skus, stores, brands
+
+# -------- BQ on-demand fetch (recommended) --------
 def fetch_campaign_tx_slice_bq(
     *,
     client,
@@ -101,8 +204,8 @@ def fetch_campaign_tx_slice_bq(
     stores_union: list[str],
     min_date, max_date
 ) -> pd.DataFrame:
-
-    # 1) Expand promo SKUs -> universe ARTICLE IDs for this window (brand / cat / subcat expansions)
+    print("Initiating...")
+    # --- 1) Expand promo SKUs -> universe ARTICLE IDs for this window (same logic as before) ---
     params = [
         bigquery.ArrayQueryParameter("skus", "STRING", [str(x) for x in promo_skus_article_ids]),
         bigquery.ScalarQueryParameter("min_d", "DATE", str(pd.to_datetime(min_date).date())),
@@ -167,16 +270,79 @@ def fetch_campaign_tx_slice_bq(
     )
     SELECT article_id FROM universe_articles
     """
+    print("Getting universe ids...", end=" ", flush=True)
     universe_ids = client.query(
         universe_sql, job_config=bigquery.QueryJobConfig(query_parameters=params)
     ).result().to_dataframe()["article_id"].astype(str).tolist()
+    print("Done!")
+    # --- 2) Clean lists (order-preserving de-dupe + drop blanks) ---
+    def _clean_list(seq):
+        out, seen = [], set()
+        for x in seq or []:
+            s = str(x).strip()
+            if not s: 
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
 
-    # 2) Call the SSOT to build the exact slice the pipeline expects
-    return get_transaction_data_by_scope(
+    universe_ids = _clean_list(universe_ids)
+    stores_union = _clean_list(stores_union)
+    print(f"Skus: {universe_ids}")
+    print(f"stores union: {stores_union.sort()}")
+    # --- 3) PREFLIGHT DIAGNOSTICS (explicit) BEFORE the heavy query ---
+    # Derive the Brand list in-scope from the base table for this (SKUs × stores × window)
+    pre_params = [
+        bigquery.ArrayQueryParameter("sku_ids",   "STRING", universe_ids),
+        bigquery.ArrayQueryParameter("store_ids", "STRING", stores_union),
+        bigquery.ScalarQueryParameter("min_d", "DATE", str(pd.to_datetime(min_date).date())),
+        bigquery.ScalarQueryParameter("max_d", "DATE", str(pd.to_datetime(max_date).date())),
+    ]
+    pre_sql = f"""
+    WITH
+      skus AS (
+        SELECT DISTINCT id
+        FROM UNNEST(@sku_ids) id
+        WHERE id IS NOT NULL AND TRIM(id) <> ''
+      )
+    #  stores AS (
+    #    SELECT DISTINCT CAST(id AS STRING) AS id
+    #    FROM UNNEST(@store_ids) id
+    #    WHERE id IS NOT NULL AND TRIM(CAST(id AS STRING)) <> ''
+    #  )
+    SELECT DISTINCT BrandDescription
+    FROM `{tx_table_fq}`
+    WHERE week_start BETWEEN @min_d AND @max_d
+      AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
+      #AND CAST(store_id  AS STRING)  IN (SELECT id FROM stores)
+      AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
+    ORDER BY BrandDescription
+    """
+    print("Getting brands...", end=" ", flush=True)
+    brands = client.query(
+        pre_sql, job_config=bigquery.QueryJobConfig(query_parameters=pre_params)
+    ).result().to_dataframe()["BrandDescription"].astype(str).tolist()
+    print("Done!")
+    # Print FULL lists
+    print(f"[Preflight] SKUs ({len(universe_ids)}): {universe_ids}")
+    print(f"[Preflight] Stores ({len(stores_union)}): {stores_union}")
+    print(f"[Preflight] Brands ({len(brands)}): {brands}")
+
+    if not universe_ids:
+        raise ValueError("[Preflight] SKU universe is empty after expansion/clean.")
+    if not stores_union:
+        raise ValueError("[Preflight] Store list is empty after clean.")
+    if not brands:
+        raise ValueError("[Preflight] Brand list empty for this scope; check inputs.")
+    print("Begininng get_transaction_data_by_scope_fast ...", end=" ", flush=True)
+    # --- 4) Execute the main pull (this function also guards against explosions) ---
+    return get_transaction_data_by_scope_fast(
         client=client,
-        base_table_fq=tx_table_fq,             # pass the same base
-        sku_list=universe_ids,                 # ARTICLE IDs (expanded)
-        store_list=[str(s) for s in stores_union],
+        base_table_fq=tx_table_fq,
+        sku_list=universe_ids,                 # ARTICLE IDs (expanded, cleaned)
+        store_list=stores_union,               # cleaned store list
         start_date=str(pd.to_datetime(min_date).date()),
         end_date=str(pd.to_datetime(max_date).date()),
     )
@@ -231,7 +397,7 @@ def run_pipeline(
     product_dim_df = None
     bq_client = None
     ranked_table = None
-
+    print("run_pipleline setup...", end=" ", flush=True)
     if tx_table:
         from google.cloud import bigquery
         bq_client = bigquery.Client(project=project)
@@ -252,8 +418,10 @@ def run_pipeline(
     t0_all = time.time(); per_stage = defaultdict(list); rows_prog = []
     bookings = sorted(media["booking_number"].astype(str).unique().tolist())
     iterator = tqdm(bookings, total=len(bookings), dynamic_ncols=True) if tqdm else bookings
-
+    print("Done!")
     for i, cid in enumerate(iterator, 1):
+        print(f"booking_number {cid}")
+        
         t0 = time.time()
         mezzo = media[media["booking_number"].astype(str) == cid].copy()
         if mezzo.empty:
@@ -275,11 +443,12 @@ def run_pipeline(
             # get fleet from tx table (cheap)
             fleet_sql = f"SELECT DISTINCT CAST(store_id AS STRING) AS sid FROM `{tx_table}`"
             fleet = bq_client.query(fleet_sql).result().to_dataframe()["sid"].tolist()
-
+        print(f"Building weekly store calendar...", end=" ", flush=True)
         cal = build_weekly_store_calendar_for_campaign(mezzo, fleet)
         wk_to_stores = weeks_to_store_sets(cal)
         stores_union = sorted({sid for s in wk_to_stores.values() for sid in s})
         per_stage["calendar"].append(time.time() - t_cal)
+        print("Done!")
 
         # date window
         min_d, max_d = _date_window(mezzo, lookback_weeks=104, pad_weeks=2)
@@ -287,6 +456,7 @@ def run_pipeline(
         # fetch campaign slice
         t_fetch = time.time()
         if bq_client is not None:
+            print(f"Entering fetch_campaign_tx_slice_bq...", end=" ", flush=True)
             tx_slice = fetch_campaign_tx_slice_bq(
                 client=bq_client,
                 tx_table_fq=tx_table,
@@ -295,6 +465,7 @@ def run_pipeline(
                 stores_union=stores_union,
                 min_date=min_d, max_date=max_d
             )
+            print("Done!")
         else:
             tx_slice = fetch_campaign_tx_slice_parquet(
                 tx_master_df=tx_master_df,

@@ -39,7 +39,7 @@ def exposure_by_grain(
         tx_master_df=tx_master_df, stores=cohort_stores, train_end_date=train_end_date, lookback_weeks=13
     )
     # SoV/ESOV at bc
-    from ri.insights.sov_esov import compute_sov_esov
+    from src.ri.insights.sov_esov import compute_sov_esov
     bc = compute_sov_esov(exposure_calendar_bc=bc, preperiod_share_bc=pre)
 
     # Project to other grains
