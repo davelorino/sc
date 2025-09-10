@@ -13,7 +13,7 @@ except Exception:
 
 # Your helpers
 from src.ri.get_data.media.parse_media_table import to_list_flexible
-from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope, get_transaction_data_by_scope_fast, get_transaction_data_by_scope_fast2
+from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope, get_transaction_data_by_scope_fast, get_transaction_data_by_scope_fast2, get_transaction_data_by_scope_fast2_cohort_total
 from src.ri.get_data.media.build_weekly_store_calendar import (
     build_weekly_store_calendar_for_campaign,
     weeks_to_store_sets,
@@ -355,16 +355,14 @@ def fetch_campaign_tx_slice_bq2(
     promo_skus_article_ids: List[str],
     stores_union: List[str],
     min_date, max_date,
-    grains: List[str],              # drives conditional SKU expansion
+    grains: List[str],              # drives conditional brand-subcat expansion (for sku universe logging only)
 ) -> pd.DataFrame:
     """
-    Campaign slice fetcher that enforces:
-      - Promo SKUs must belong to EXACTLY ONE brand (0 or >1 => skip campaign).
-      - No whole-category / whole-subcategory expansion.
-      - Universe = promo SKUs (+ brand-subcategory SKUs that share (Brand, SubCategory) with the promo SKUs)
-        only if grains require brand-level modeling (brand_subcategory).
-      - Delegates to get_transaction_data_by_scope_fast2 which computes:
-          * new_to_brand_* as brand-subcategory.
+    Enforces that promo SKUs belong to EXACTLY ONE brand (0 or >1 => SkipCampaign).
+    No category/subcategory-wide expansions. Optionally expands to brand-subcategory
+    for visibility when requested via 'grains'.
+
+    Returns cohort×week totals by calling get_transaction_data_by_scope_fast2_cohort_total.
     """
     print("Initiating...")
 
@@ -389,8 +387,8 @@ def fetch_campaign_tx_slice_bq2(
     min_d = _as_date(min_date)
     max_d = _as_date(max_date)
 
-    # ---------- Enforce: promo SKUs map to exactly ONE brand ----------
-    promo_brands_sql = f"""
+    # ---------- Strict brand check: EXACTLY ONE brand among promo SKUs over window ----------
+    brand_check_sql = f"""
     WITH skus AS (
       SELECT DISTINCT id FROM UNNEST(@skus) AS id
       WHERE id IS NOT NULL AND TRIM(id) <> ''
@@ -407,29 +405,25 @@ def fetch_campaign_tx_slice_bq2(
         bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
     ]
     promo_brands_df = client.query(
-        promo_brands_sql, job_config=bigquery.QueryJobConfig(query_parameters=brand_params)
+        brand_check_sql, job_config=bigquery.QueryJobConfig(query_parameters=brand_params)
     ).result().to_dataframe()
 
-    n_brands_promo = int(promo_brands_df.shape[0])
-    brands_pretty  = promo_brands_df["brand"].astype(str).tolist()
-    print(f"[Diag] Promo-SKU brand count: {n_brands_promo} | {brands_pretty}")
+    n_brands = int(promo_brands_df.shape[0])
+    brands_list = promo_brands_df["brand"].astype(str).tolist()
+    print(f"[Diag] Promo-SKU brand count: {n_brands} | {brands_list}")
 
-    if n_brands_promo != 1:
-        raise ValueError(f"[SkipCampaign] Promo SKUs span {n_brands_promo} brand(s); require exactly 1. Found: {brands_pretty}")
+    if n_brands != 1:
+        raise ValueError(f"[SkipCampaign] Promo SKUs span {n_brands} brand(s); require exactly 1. Found: {brands_list}")
 
-    # ---------- Build universe with NO whole-category/whole-subcategory ----------
-    # Allow brand_subcategory expansion ONLY if grains require "brand" modeling (we alias brand -> brand_subcategory).
-    wants_brand_sub = any(g in {"brand","brand_subcategory"} for g in grains)
+    # ---------- OPTIONAL: build a small SKU universe for logging (no category-wide expansion) ----------
+    wants_brand_sub = any(g.lower() in {"brand","brand_subcategory"} for g in (grains or []))
 
     with_parts = []
-
     with_parts.append("""
 skus AS (
   SELECT DISTINCT id FROM UNNEST(@skus) AS id
   WHERE id IS NOT NULL AND TRIM(id) <> ''
 )""")
-
-    # Always include the listed promo SKUs
     with_parts.append(f"""
 sku_only AS (
   SELECT DISTINCT CAST(t.article_id AS STRING) AS article_id
@@ -438,7 +432,6 @@ sku_only AS (
   WHERE t.week_start BETWEEN @min_d AND @max_d
 )""")
 
-    # Expand ONLY to brand-subcategory pairs implied by the promo SKUs
     if wants_brand_sub:
         with_parts.append(f"""
 promo_brand_sub AS (
@@ -465,56 +458,30 @@ brand_subcat AS (
     universe_sql = "WITH\n" + ",\n".join(with_parts) + "\n" + (
         "SELECT article_id\nFROM (\n  " + "\n  UNION DISTINCT\n  ".join(union_selects) + "\n)"
     )
-
-    params = [
+    u_params = [
         bigquery.ArrayQueryParameter("skus", "STRING", promo_skus_article_ids),
         bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
         bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
     ]
-
     print("Getting universe ids...", end=" ", flush=True)
     universe_ids = client.query(
-        universe_sql, job_config=bigquery.QueryJobConfig(query_parameters=params)
+        universe_sql, job_config=bigquery.QueryJobConfig(query_parameters=u_params)
     ).result().to_dataframe()["article_id"].astype(str).tolist()
     print("Done!")
-
     universe_ids = _clean_list(universe_ids)
-
-    # Optional, cheap sampled brand log (visibility only)
-    pre_sql = f"""
-    DECLARE sample_start DATE DEFAULT GREATEST(@min_d, DATE_SUB(@max_d, INTERVAL 28 DAY));
-    SELECT DISTINCT BrandDescription
-    FROM `{tx_table_fq}`
-    WHERE week_start BETWEEN sample_start AND @max_d
-      AND CAST(article_id AS STRING) IN UNNEST(@sku_ids)
-      AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
-    ORDER BY 1
-    """
-    pre_params = [
-        bigquery.ArrayQueryParameter("sku_ids", "STRING", universe_ids),
-        bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
-        bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
-    ]
-    print("Getting brands (sampled)...", end=" ", flush=True)
-    brands = client.query(
-        pre_sql, job_config=bigquery.QueryJobConfig(query_parameters=pre_params)
-    ).result().to_dataframe()["BrandDescription"].astype(str).tolist()
-    print("Done!")
     print(f"[Preflight] SKUs ({len(universe_ids)}): {universe_ids[:20]}{' ...' if len(universe_ids)>20 else ''}")
     print(f"[Preflight] Stores ({len(stores_union)}; all_stores={len(stores_union)==0})")
-    print(f"[Preflight] Brands (sampled) ({len(brands)}): {brands[:20]}{' ...' if len(brands)>20 else ''}")
 
     if not universe_ids:
         raise ValueError("[SkipCampaign] SKU universe empty after expansion/clean.")
 
-    # Pull the scoped transactions (fast) — new_to_brand_* is brand-subcategory by construction
-    print("Begin get_transaction_data_by_scope_fast2 ...", end=" ", flush=True)
-    from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope_fast2
-    df = get_transaction_data_by_scope_fast2(
+    # ---------- Cohort×week TOTALS (global lookbacks, cohort-scoped aggregation) ----------
+    print("Begin get_transaction_data_by_scope_fast2_cohort_total ...", end=" ", flush=True)
+    df = get_transaction_data_by_scope_fast2_cohort_total(
         client=client,
         base_table_fq=tx_table_fq,
-        sku_list=universe_ids,
-        store_list=stores_union,     # empty => all stores inside SQL
+        sku_list=universe_ids,        # pass promo (± brand-subcat) SKUs
+        store_list=stores_union,      # [] => all stores (cohort = whole fleet)
         start_date=str(min_d),
         end_date=str(max_d),
     )

@@ -1082,3 +1082,360 @@ def get_transaction_data_by_scope_fast2(
     job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
     df = job.result().to_dataframe(create_bqstorage_client=True)
     return df
+
+def get_transaction_data_by_scope_fast2_cohort_total(
+    client: Optional[bigquery.Client],
+    base_table_fq: str,           # e.g. project.dataset.sku_store_week_sales_base
+    sku_list: List[str],          # ARTICLE IDs (strings)
+    store_list: List[str],        # store_ids (strings or ints) — defines the cohort; empty => all stores
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Cohort × week totals with CRN×WEEK-level new_to_* logic and global lookbacks.
+
+    Targets produced (one row per week_start):
+      - sales
+      - shoppers
+      - new_to_sku_sales_13m, new_to_sku_shoppers_13m
+      - new_to_brand_sales_13m, new_to_brand_shoppers_13m   (brand = brand-subcategory)
+    EXOG aggregated to cohort-week (sales-weighted where sensible):
+      - discountpercent
+      - max_internal_competitor_discount_percent
+      - n_competitors, n_any_cheaper, n_shelf_cheaper,
+        n_promo_cheaper_no_hurdle, n_promo_cheaper_hurdle,
+        avg_cheaper_gap, worst_gap, p90_gap
+      - brochure_Not on brochure, multibuy_Not on Multibuy (sales-weighted shares)
+    """
+    if client is None:
+        client = bigquery.Client()
+
+    from datetime import date
+
+    def _clean(vals):
+        out, seen = [], set()
+        for v in (vals or []):
+            s = str(v).strip() if v is not None else ""
+            if s and s.lower() != "nan" and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    sku_ids_clean   = _clean(sku_list)
+    store_ids_clean = _clean(store_list)
+    all_stores = (len(store_ids_clean) == 0)
+
+    if not sku_ids_clean:
+        raise ValueError("Sanitized SKU list is empty.")
+
+    min_d = pd.to_datetime(start_date).date() if start_date else date(1900,1,1)
+    max_d = pd.to_datetime(end_date).date()   if end_date   else date(2100,1,1)
+
+    try:
+        store_ids_native = [int(x) for x in store_ids_clean]
+        store_param_type = "INT64"
+    except Exception:
+        store_ids_native = [str(x) for x in store_ids_clean]
+        store_param_type = "STRING"
+
+    params = [
+        bigquery.ArrayQueryParameter("sku_ids",   "STRING", [str(x) for x in sku_ids_clean]),
+        bigquery.ArrayQueryParameter("store_ids", store_param_type, store_ids_native),
+        bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
+        bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
+        bigquery.ScalarQueryParameter("all_stores", "BOOL", all_stores),
+    ]
+
+    sql = f"""
+    DECLARE lookback_13m_start DATE DEFAULT DATE_SUB(@min_d, INTERVAL 400 DAY);
+    DECLARE all_stores BOOL DEFAULT @all_stores;
+
+    /* Params */
+    WITH
+    skus AS (
+      SELECT DISTINCT id
+      FROM UNNEST(@sku_ids) AS id
+      WHERE id IS NOT NULL AND TRIM(id) <> ''
+    ),
+    stores AS (
+      SELECT DISTINCT CAST(id AS STRING) AS id
+      FROM UNNEST(@store_ids) AS id
+      WHERE id IS NOT NULL AND TRIM(CAST(id AS STRING)) <> ''
+    ),
+
+    /* A) Cohort-week product base (sum sales over cohort stores) */
+    base_cohort AS (
+      SELECT
+        t.week_start,
+        t.product_number,
+        t.article_id,
+        ANY_VALUE(t.BrandDescription)  AS BrandDescription,
+        ANY_VALUE(t.CategoryDescription) AS CategoryDescription,
+        ANY_VALUE(t.SubCategoryDescription) AS SubCategoryDescription,
+
+        -- exogs per product-week; keep as-is here
+        ANY_VALUE(t.discountpercent)                       AS discountpercent,
+        ANY_VALUE(t.multibuy)                              AS multibuy,
+        ANY_VALUE(t.brochure)                              AS brochure,
+        ANY_VALUE(t.n_competitors)                         AS n_competitors,
+        ANY_VALUE(t.n_any_cheaper)                         AS n_any_cheaper,
+        ANY_VALUE(t.n_shelf_cheaper)                       AS n_shelf_cheaper,
+        ANY_VALUE(t.n_promo_cheaper_no_hurdle)             AS n_promo_cheaper_no_hurdle,
+        ANY_VALUE(t.n_promo_cheaper_hurdle)                AS n_promo_cheaper_hurdle,
+        ANY_VALUE(t.avg_cheaper_gap)                       AS avg_cheaper_gap,
+        ANY_VALUE(t.worst_gap)                             AS worst_gap,
+        ANY_VALUE(t.p90_gap)                               AS p90_gap,
+
+        SUM(t.sales) AS sales
+      FROM `{base_table_fq}` t
+      JOIN skus s ON CAST(t.article_id AS STRING) = s.id
+      WHERE t.week_start BETWEEN @min_d AND @max_d
+        AND ( all_stores OR CAST(t.store_id AS STRING) IN (SELECT id FROM stores) )
+      GROUP BY 1,2,3
+    ),
+
+    /* Internal competitor discount (from promo table) aggregated to week */
+    pf_keys AS (
+      SELECT DISTINCT week_start, BrandDescription, CategoryDescription, PriceFamilyCode
+      FROM (
+        SELECT
+          t.week_start,
+          ANY_VALUE(t.BrandDescription) AS BrandDescription,
+          ANY_VALUE(t.CategoryDescription) AS CategoryDescription,
+          ANY_VALUE(t.PriceFamilyCode) AS PriceFamilyCode
+        FROM `{base_table_fq}` t
+        JOIN skus s ON CAST(t.article_id AS STRING)=s.id
+        WHERE t.week_start BETWEEN @min_d AND @max_d
+          AND ( all_stores OR CAST(t.store_id AS STRING) IN (SELECT id FROM stores) )
+        GROUP BY t.week_start
+      )
+    ),
+    promo_pf AS (
+      SELECT
+        pwstartdate    AS week_start,
+        petpricefamily AS PriceFamilyCode,
+        discountpercent AS pf_discount,
+        brochure,
+        MBTrigger      AS multibuy
+      FROM `gcp-wow-ent-im-tbl-prod.adp_dm_quantium_inbound_view_smkt.qtm_smkt_pet_incrementality_v3_v`
+      WHERE SalesDistrict='National'
+        AND FutureFlag='PAST'
+    ),
+    mcd_store AS (
+      SELECT
+        k.week_start, k.PriceFamilyCode,
+        MAX(COALESCE(pf_discount,0.0)) AS max_internal_competitor_discount_percent
+      FROM pf_keys k
+      LEFT JOIN promo_pf p
+        ON p.week_start = k.week_start
+       AND p.PriceFamilyCode = k.PriceFamilyCode
+      GROUP BY 1,2
+    ),
+    mcd_week AS (
+      SELECT week_start,
+             MAX(max_internal_competitor_discount_percent) AS max_internal_competitor_discount_percent
+      FROM mcd_store
+      GROUP BY 1
+    ),
+
+    /* B) Cohort CRN×WEEK streams (store-scoped) */
+    crn_sku_cohort_wk AS (
+      SELECT
+        DATE_TRUNC(cb.BusinessDate, WEEK(Wednesday))  AS week_start,
+        cb.ProductNumber                              AS product_number,
+        TRIM(CAST(cb.CRN AS STRING))                  AS crn_valid,
+        SUM(cb.TotalAmountIncludingGST)               AS sales_amount_wk
+      FROM `gcp-wow-wiq-ca-prod.wiqIN_DataAssets.CustomerBaseTransaction_v` cb
+      JOIN skus s ON CAST(cb.Article AS STRING) = s.id
+      WHERE cb.SalesOrganisation='1005'
+        AND LOWER(cb.Channel)='in store'
+        AND cb.TotalAmountIncludingGST > 0
+        AND cb.CRN IS NOT NULL
+        AND SAFE_CAST(cb.CRN AS INT64) IS NOT NULL
+        AND LENGTH(CAST(cb.CRN AS STRING)) >= 3
+        AND cb.BusinessDate BETWEEN @min_d AND @max_d
+        AND ( all_stores OR CAST(cb.SiteNumber AS STRING) IN (SELECT id FROM stores) )
+      GROUP BY 1,2,3
+    ),
+    cohort_shoppers AS (
+      SELECT week_start, COUNT(DISTINCT crn_valid) AS shoppers
+      FROM crn_sku_cohort_wk
+      GROUP BY 1
+    ),
+
+    /* C) GLOBAL lookbacks (all stores) at weekly grain via LAG */
+    tx_all_sku_wk AS (
+      SELECT
+        DATE_TRUNC(cb.BusinessDate, WEEK(Wednesday)) AS week_start,
+        cb.ProductNumber                             AS product_number,
+        TRIM(CAST(cb.CRN AS STRING))                 AS crn_valid
+      FROM `gcp-wow-wiq-ca-prod.wiqIN_DataAssets.CustomerBaseTransaction_v` cb
+      JOIN skus s ON CAST(cb.Article AS STRING) = s.id
+      WHERE cb.SalesOrganisation='1005'
+        AND LOWER(cb.Channel)='in store'
+        AND cb.TotalAmountIncludingGST > 0
+        AND cb.CRN IS NOT NULL
+        AND SAFE_CAST(cb.CRN AS INT64) IS NOT NULL
+        AND LENGTH(CAST(cb.CRN AS STRING)) >= 3
+        AND cb.BusinessDate BETWEEN lookback_13m_start AND @max_d
+      GROUP BY 1,2,3
+    ),
+    prev_sku_wk AS (
+      SELECT *,
+             LAG(week_start) OVER (PARTITION BY crn_valid, product_number ORDER BY week_start) AS prev_wk
+      FROM tx_all_sku_wk
+    ),
+    flags_sku_wk AS (
+      SELECT week_start, product_number, crn_valid,
+             IF(prev_wk IS NULL OR DATE_DIFF(week_start, prev_wk, MONTH) >= 13, TRUE, FALSE) AS is_new_to_sku_13m
+      FROM prev_sku_wk
+      WHERE week_start BETWEEN @min_d AND @max_d
+    ),
+
+    bs_pairs AS (
+      SELECT DISTINCT BrandDescription, SubCategoryDescription
+      FROM base_cohort
+      WHERE BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
+        AND SubCategoryDescription IS NOT NULL AND TRIM(SubCategoryDescription) <> ''
+    ),
+    tx_all_bs_wk AS (
+      SELECT
+        DATE_TRUNC(cb.BusinessDate, WEEK(Wednesday)) AS week_start,
+        cb.BrandDescription, cb.SubCategoryDescription,
+        TRIM(CAST(cb.CRN AS STRING))                 AS crn_valid
+      FROM `gcp-wow-wiq-ca-prod.wiqIN_DataAssets.CustomerBaseTransaction_v` cb
+      JOIN bs_pairs p
+        ON cb.BrandDescription       = p.BrandDescription
+       AND cb.SubCategoryDescription = p.SubCategoryDescription
+      WHERE cb.SalesOrganisation='1005'
+        AND LOWER(cb.Channel)='in store'
+        AND cb.TotalAmountIncludingGST > 0
+        AND cb.CRN IS NOT NULL
+        AND SAFE_CAST(cb.CRN AS INT64) IS NOT NULL
+        AND LENGTH(CAST(cb.CRN AS STRING)) >= 3
+        AND cb.BusinessDate BETWEEN lookback_13m_start AND @max_d
+      GROUP BY 1,2,3,4
+    ),
+    prev_bs_wk AS (
+      SELECT *,
+             LAG(week_start) OVER (PARTITION BY crn_valid, BrandDescription, SubCategoryDescription ORDER BY week_start) AS prev_wk
+      FROM tx_all_bs_wk
+    ),
+    flags_bs_wk AS (
+      SELECT week_start, BrandDescription, SubCategoryDescription, crn_valid,
+             IF(prev_wk IS NULL OR DATE_DIFF(week_start, prev_wk, MONTH) >= 13, TRUE, FALSE) AS is_new_to_brand_sub_13m
+      FROM prev_bs_wk
+      WHERE week_start BETWEEN @min_d AND @max_d
+    ),
+
+    /* D) Join flags to cohort CRN×WEEK planes and aggregate to cohort-week totals */
+    sku_flagged AS (
+      SELECT
+        c.week_start, c.crn_valid, c.sales_amount_wk,
+        f.is_new_to_sku_13m
+      FROM crn_sku_cohort_wk c
+      LEFT JOIN flags_sku_wk f
+        ON f.week_start = c.week_start
+       AND f.product_number = c.product_number
+       AND f.crn_valid = c.crn_valid
+    ),
+    new_to_sku_cohort AS (
+      SELECT
+        week_start,
+        COUNT(DISTINCT IF(is_new_to_sku_13m, crn_valid, NULL)) AS new_to_sku_shoppers_13m,
+        SUM(           IF(is_new_to_sku_13m, sales_amount_wk, 0.0)) AS new_to_sku_sales_13m
+      FROM sku_flagged
+      GROUP BY 1
+    ),
+
+    bs_cohort_wk AS (
+      SELECT
+        DATE_TRUNC(cb.BusinessDate, WEEK(Wednesday)) AS week_start,
+        TRIM(CAST(cb.CRN AS STRING))                 AS crn_valid,
+        SUM(cb.TotalAmountIncludingGST)              AS sales_amount_wk_bs
+      FROM `gcp-wow-wiq-ca-prod.wiqIN_DataAssets.CustomerBaseTransaction_v` cb
+      JOIN bs_pairs p
+        ON cb.BrandDescription       = p.BrandDescription
+       AND cb.SubCategoryDescription = p.SubCategoryDescription
+      WHERE cb.SalesOrganisation='1005'
+        AND LOWER(cb.Channel)='in store'
+        AND cb.TotalAmountIncludingGST > 0
+        AND cb.CRN IS NOT NULL
+        AND SAFE_CAST(cb.CRN AS INT64) IS NOT NULL
+        AND LENGTH(CAST(cb.CRN AS STRING)) >= 3
+        AND cb.BusinessDate BETWEEN @min_d AND @max_d
+        AND ( all_stores OR CAST(cb.SiteNumber AS STRING) IN (SELECT id FROM stores) )
+      GROUP BY 1,2
+    ),
+    bs_flagged AS (
+      SELECT
+        b.week_start, b.crn_valid, b.sales_amount_wk_bs,
+        f.is_new_to_brand_sub_13m
+      FROM bs_cohort_wk b
+      LEFT JOIN flags_bs_wk f
+        ON f.week_start = b.week_start
+       AND f.crn_valid  = b.crn_valid
+    ),
+    new_to_brand_sub_cohort AS (
+      SELECT
+        week_start,
+        COUNT(DISTINCT IF(is_new_to_brand_sub_13m, crn_valid, NULL)) AS new_to_brand_shoppers_13m,
+        SUM(           IF(is_new_to_brand_sub_13m, sales_amount_wk_bs, 0.0)) AS new_to_brand_sales_13m
+      FROM bs_flagged
+      GROUP BY 1
+    ),
+
+    /* E) Aggregate EXOG to cohort-week (sales-weighted) + total sales */
+    exog_agg AS (
+      SELECT
+        week_start,
+        SUM(sales) AS sales,
+
+        SAFE_DIVIDE(SUM(COALESCE(discountpercent,0) * sales), NULLIF(SUM(sales),0))       AS discountpercent,
+
+        SAFE_DIVIDE(SUM(COALESCE(n_competitors,0) * sales), NULLIF(SUM(sales),0))         AS n_competitors,
+        SAFE_DIVIDE(SUM(COALESCE(n_any_cheaper,0) * sales), NULLIF(SUM(sales),0))         AS n_any_cheaper,
+        SAFE_DIVIDE(SUM(COALESCE(n_shelf_cheaper,0) * sales), NULLIF(SUM(sales),0))       AS n_shelf_cheaper,
+        SAFE_DIVIDE(SUM(COALESCE(n_promo_cheaper_no_hurdle,0) * sales), NULLIF(SUM(sales),0)) AS n_promo_cheaper_no_hurdle,
+        SAFE_DIVIDE(SUM(COALESCE(n_promo_cheaper_hurdle,0) * sales), NULLIF(SUM(sales),0))    AS n_promo_cheaper_hurdle,
+
+        SAFE_DIVIDE(SUM(COALESCE(avg_cheaper_gap,0) * sales), NULLIF(SUM(sales),0))       AS avg_cheaper_gap,
+        SAFE_DIVIDE(SUM(COALESCE(worst_gap,0) * sales), NULLIF(SUM(sales),0))             AS worst_gap,
+        SAFE_DIVIDE(SUM(COALESCE(p90_gap,0) * sales), NULLIF(SUM(sales),0))               AS p90_gap,
+
+        SAFE_DIVIDE(SUM(IF(brochure = 'Not on brochure', sales, 0)), NULLIF(SUM(sales),0)) AS `brochure_Not on brochure`,
+        SAFE_DIVIDE(SUM(IF(multibuy  = 'Not on Multibuy', sales, 0)), NULLIF(SUM(sales),0)) AS `multibuy_Not on Multibuy`
+      FROM base_cohort
+      GROUP BY 1
+    )
+
+    /* Final: cohort-week totals only */
+    SELECT
+      e.week_start,
+
+      -- EXOG
+      e.discountpercent,
+      COALESCE(m.max_internal_competitor_discount_percent, 0.0) AS max_internal_competitor_discount_percent,
+      e.n_competitors, e.n_any_cheaper, e.n_shelf_cheaper,
+      e.n_promo_cheaper_no_hurdle, e.n_promo_cheaper_hurdle,
+      e.avg_cheaper_gap, e.worst_gap, e.p90_gap,
+      e.`brochure_Not on brochure`, e.`multibuy_Not on Multibuy`,
+
+      -- Targets
+      e.sales,
+      COALESCE(cs.shoppers, 0)                                  AS shoppers,
+      COALESCE(ns.new_to_sku_sales_13m,   0.0)                  AS new_to_sku_sales_13m,
+      COALESCE(ns.new_to_sku_shoppers_13m,0)                    AS new_to_sku_shoppers_13m,
+      COALESCE(nb.new_to_brand_sales_13m,   0.0)                AS new_to_brand_sales_13m,
+      COALESCE(nb.new_to_brand_shoppers_13m,0)                  AS new_to_brand_shoppers_13m
+
+    FROM exog_agg e
+    LEFT JOIN mcd_week m ON m.week_start = e.week_start
+    LEFT JOIN cohort_shoppers cs ON cs.week_start = e.week_start
+    LEFT JOIN new_to_sku_cohort ns ON ns.week_start = e.week_start
+    LEFT JOIN new_to_brand_sub_cohort nb ON nb.week_start = e.week_start
+    ORDER BY e.week_start;
+    """
+
+    job = client.query(sql, job_config=bigquery.QueryJobConfig(query_parameters=params))
+    return job.result().to_dataframe(create_bqstorage_client=True)
