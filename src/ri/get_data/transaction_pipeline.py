@@ -1083,6 +1083,7 @@ def get_transaction_data_by_scope_fast2(
     df = job.result().to_dataframe(create_bqstorage_client=True)
     return df
 
+
 def get_transaction_data_by_scope_fast2_cohort_total(
     client: Optional[bigquery.Client],
     base_table_fq: str,           # e.g. project.dataset.sku_store_week_sales_base
@@ -1094,18 +1095,22 @@ def get_transaction_data_by_scope_fast2_cohort_total(
     """
     Cohort × week totals with CRN×WEEK-level new_to_* logic and global lookbacks.
 
-    Targets produced (one row per week_start):
+    Targets (one row per week_start):
       - sales
       - shoppers
       - new_to_sku_sales_13m, new_to_sku_shoppers_13m
       - new_to_brand_sales_13m, new_to_brand_shoppers_13m   (brand = brand-subcategory)
+
     EXOG aggregated to cohort-week (sales-weighted where sensible):
       - discountpercent
       - max_internal_competitor_discount_percent
       - n_competitors, n_any_cheaper, n_shelf_cheaper,
         n_promo_cheaper_no_hurdle, n_promo_cheaper_hurdle,
         avg_cheaper_gap, worst_gap, p90_gap
-      - brochure_Not on brochure, multibuy_Not on Multibuy (sales-weighted shares)
+      - brochure_Not on brochure, multibuy_Not on Multibuy (sales-weighted *shares*)
+
+    Node keys included (constant per campaign):
+      - BrandDescription, CategoryDescription, SubCategoryDescription
     """
     if client is None:
         client = bigquery.Client()
@@ -1169,9 +1174,9 @@ def get_transaction_data_by_scope_fast2_cohort_total(
         t.week_start,
         t.product_number,
         t.article_id,
-        ANY_VALUE(t.BrandDescription)  AS BrandDescription,
-        ANY_VALUE(t.CategoryDescription) AS CategoryDescription,
-        ANY_VALUE(t.SubCategoryDescription) AS SubCategoryDescription,
+        ANY_VALUE(t.BrandDescription)        AS BrandDescription,
+        ANY_VALUE(t.CategoryDescription)     AS CategoryDescription,
+        ANY_VALUE(t.SubCategoryDescription)  AS SubCategoryDescription,
 
         -- exogs per product-week; keep as-is here
         ANY_VALUE(t.discountpercent)                       AS discountpercent,
@@ -1194,15 +1199,24 @@ def get_transaction_data_by_scope_fast2_cohort_total(
       GROUP BY 1,2,3
     ),
 
+    /* Brand/category/subcategory constants for this slice (single brand-sub expected by runner) */
+    brand_cat_sub AS (
+      SELECT
+        ANY_VALUE(BrandDescription)        AS BrandDescription,
+        ANY_VALUE(CategoryDescription)     AS CategoryDescription,
+        ANY_VALUE(SubCategoryDescription)  AS SubCategoryDescription
+      FROM base_cohort
+    ),
+
     /* Internal competitor discount (from promo table) aggregated to week */
     pf_keys AS (
       SELECT DISTINCT week_start, BrandDescription, CategoryDescription, PriceFamilyCode
       FROM (
         SELECT
           t.week_start,
-          ANY_VALUE(t.BrandDescription) AS BrandDescription,
-          ANY_VALUE(t.CategoryDescription) AS CategoryDescription,
-          ANY_VALUE(t.PriceFamilyCode) AS PriceFamilyCode
+          ANY_VALUE(t.BrandDescription)        AS BrandDescription,
+          ANY_VALUE(t.CategoryDescription)     AS CategoryDescription,
+          ANY_VALUE(t.PriceFamilyCode)         AS PriceFamilyCode
         FROM `{base_table_fq}` t
         JOIN skus s ON CAST(t.article_id AS STRING)=s.id
         WHERE t.week_start BETWEEN @min_d AND @max_d
@@ -1342,8 +1356,8 @@ def get_transaction_data_by_scope_fast2_cohort_total(
     new_to_sku_cohort AS (
       SELECT
         week_start,
-        COUNT(DISTINCT IF(is_new_to_sku_13m, crn_valid, NULL)) AS new_to_sku_shoppers_13m,
-        SUM(           IF(is_new_to_sku_13m, sales_amount_wk, 0.0)) AS new_to_sku_sales_13m
+        COUNT(DISTINCT IF(is_new_to_sku_13m, crn_valid, NULL))        AS new_to_sku_shoppers_13m,
+        SUM(           IF(is_new_to_sku_13m, sales_amount_wk, 0.0))   AS new_to_sku_sales_13m
       FROM sku_flagged
       GROUP BY 1
     ),
@@ -1379,7 +1393,7 @@ def get_transaction_data_by_scope_fast2_cohort_total(
     new_to_brand_sub_cohort AS (
       SELECT
         week_start,
-        COUNT(DISTINCT IF(is_new_to_brand_sub_13m, crn_valid, NULL)) AS new_to_brand_shoppers_13m,
+        COUNT(DISTINCT IF(is_new_to_brand_sub_13m, crn_valid, NULL))        AS new_to_brand_shoppers_13m,
         SUM(           IF(is_new_to_brand_sub_13m, sales_amount_wk_bs, 0.0)) AS new_to_brand_sales_13m
       FROM bs_flagged
       GROUP BY 1
@@ -1409,9 +1423,14 @@ def get_transaction_data_by_scope_fast2_cohort_total(
       GROUP BY 1
     )
 
-    /* Final: cohort-week totals only */
+    /* Final: cohort-week totals only + constant node keys */
     SELECT
       e.week_start,
+
+      -- node keys (constant across the campaign; required by _mask_node)
+      dim.BrandDescription,
+      dim.CategoryDescription,
+      dim.SubCategoryDescription,
 
       -- EXOG
       e.discountpercent,
@@ -1430,9 +1449,10 @@ def get_transaction_data_by_scope_fast2_cohort_total(
       COALESCE(nb.new_to_brand_shoppers_13m,0)                  AS new_to_brand_shoppers_13m
 
     FROM exog_agg e
-    LEFT JOIN mcd_week m ON m.week_start = e.week_start
-    LEFT JOIN cohort_shoppers cs ON cs.week_start = e.week_start
-    LEFT JOIN new_to_sku_cohort ns ON ns.week_start = e.week_start
+    CROSS JOIN brand_cat_sub dim
+    LEFT JOIN mcd_week m            ON m.week_start = e.week_start
+    LEFT JOIN cohort_shoppers cs    ON cs.week_start = e.week_start
+    LEFT JOIN new_to_sku_cohort ns  ON ns.week_start = e.week_start
     LEFT JOIN new_to_brand_sub_cohort nb ON nb.week_start = e.week_start
     ORDER BY e.week_start;
     """

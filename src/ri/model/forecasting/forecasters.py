@@ -16,54 +16,48 @@ def _make_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 def fit_predict_series(
-    hist_df: pd.DataFrame,  # columns: ds, y, [reg...]
+    hist_df: pd.DataFrame,
     forecast_ds: List[pd.Timestamp],
-    reg_cols: Optional[List[str]] = None,
-    params: Optional[Dict] = None
+    reg_cols: Optional[List[str]],
+    params: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
-    Train on all ds < min(forecast_ds), predict for forecast_ds (one-step or many).
-    Uses XGB with time features + lags/rolls. Exogenous regressors are allowed.
+    Trains a simple regressor on (ds,y,+exog) and predicts yhat for the given ds list.
+    Only uses feature columns that actually exist in hist_df.
+    Falls back to an intercept-only model if no features are available.
     """
-    if reg_cols is None: reg_cols = []
-    if params is None:
-        params = dict(n_estimators=500, learning_rate=0.05, max_depth=4,
-                      subsample=0.9, colsample_bytree=0.9, reg_lambda=1.0,
-                      objective="reg:squarederror", tree_method="hist",
-                      n_jobs=4, random_state=42)
-
-    df = hist_df.copy().sort_values("ds")
+    df = hist_df.copy()
     df["ds"] = pd.to_datetime(df["ds"])
-    cutoff = min(forecast_ds)
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
 
-    tr = df[df["ds"] < cutoff].copy()
-    te = pd.DataFrame({"ds": sorted(set(map(pd.Timestamp, forecast_ds)))})
-    if len(tr) < 8:
-        return te.assign(yhat=np.nan)
+    feat_cols = [c for c in (reg_cols or []) if c in df.columns]
 
-    tr = _make_time_features(tr)
-    te = _make_time_features(te)
+    fc_dates = [pd.to_datetime(d) for d in (forecast_ds or [])]
+    min_fc = min(fc_dates) if fc_dates else None
 
-    # lags & rolls
-    for L in (1,2,4): tr[f"lag_{L}"] = tr["y"].shift(L)
-    for W in (4,8):   tr[f"roll_mean_{W}"] = tr["y"].shift(1).rolling(W, min_periods=1).mean()
+    if min_fc is None:
+        tr = df[["ds","y"]].copy()
+        te = pd.DataFrame(columns=["ds"])
+    else:
+        tr = df[df["ds"] < min_fc][["ds","y"]].copy()
+        te = pd.DataFrame({"ds": fc_dates})
 
-    # design
-    feat_cols = [c for c in tr.columns if c not in ("ds","y")]
-    # Append exogenous regressors if present
-    for c in reg_cols:
-        if c not in feat_cols and c in df.columns:
-            feat_cols.append(c)
+    if feat_cols:
+        tr = tr.merge(df[["ds"] + feat_cols], on="ds", how="left")
+        te = te.merge(df[["ds"] + feat_cols], on="ds", how="left")
+    else:
+        tr["_bias"] = 1.0
+        te["_bias"] = 1.0
+        feat_cols = ["_bias"]
 
-    # Merge regressors
-    if reg_cols:
-        tr = tr.merge(df[["ds"]+reg_cols], on="ds", how="left")
-        te = te.merge(df[["ds"]+reg_cols], on="ds", how="left").fillna(0.0)
+    tr = tr.fillna(0.0)
+    te = te.fillna(0.0)
 
-    Xtr = tr[feat_cols].fillna(0.0); ytr = tr["y"]
-    model = XGBRegressor(**params).fit(Xtr, ytr)
+    model = XGBRegressor(**(params or {})).fit(tr[feat_cols], tr["y"])
 
-    # recursive preds not necessary if we only need given dates; still fine to predict directly
-    Xte = te[feat_cols].fillna(0.0)
-    te["yhat"] = model.predict(Xte)
-    return te[["ds","yhat"]]
+    if te.empty:
+        return pd.DataFrame(columns=["ds","yhat"])
+
+    out = te[["ds"]].copy()
+    out["yhat"] = model.predict(te[feat_cols])
+    return out

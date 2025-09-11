@@ -112,85 +112,115 @@ def _sanitize_ids(values: List[str], type_: str, name: str) -> List[str]:
         deduped.append(s)
     return deduped
 
+
+def _clean_list(seq):
+    out, seen = [], set()
+    for x in (seq or []):
+        s = str(x).strip() if x is not None else ""
+        if s and s.lower() != "nan" and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
 def preflight_scope(
+    *,
     client: bigquery.Client,
     base_table_fq: str,
     sku_list: List[str],
-    store_list: List[str],
-    start_date: Optional[str],
-    end_date: Optional[str],
-    log_dir: str = "preflight_logs",
+    store_list: List[str],   # [] means ALL STORES
+    start_date,
+    end_date,
     print_full: bool = True,
 ) -> Tuple[List[str], List[str], List[str]]:
-    os.makedirs(log_dir, exist_ok=True)
-    tstamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # 1) Sanitize lists
-    skus = _sanitize_ids(sku_list, "STRING", "sku_ids")
-    stores = _sanitize_ids(store_list, "INT64",  "store_ids")  # change to STRING if your store_id is string in BQ
-
-    # 2) Get brands implied by base for these (skus × stores × dates)
-    sql_brands = f"""
-    DECLARE min_d DATE DEFAULT @min_d;
-    DECLARE max_d DATE DEFAULT @max_d;
-    WITH skus AS (
-      SELECT DISTINCT id
-      FROM UNNEST(@sku_ids) id
-      WHERE id IS NOT NULL AND TRIM(id) <> ''
-    ),
-    stores AS (
-      SELECT DISTINCT CAST(id AS STRING) AS id
-      FROM UNNEST(@store_ids) id
-      WHERE id IS NOT NULL AND TRIM(CAST(id AS STRING)) <> ''
-    )
-    SELECT DISTINCT BrandDescription
-    FROM `{base_table_fq}`
-    WHERE week_start BETWEEN min_d AND max_d
-      AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
-      AND CAST(store_id  AS STRING)  IN (SELECT id FROM stores)
-      AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
-    ORDER BY BrandDescription
     """
-    job = client.query(
-        sql_brands,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("sku_ids", "STRING", skus),
-                bigquery.ArrayQueryParameter("store_ids", "STRING", stores), # casted to STRING above
-                bigquery.ScalarQueryParameter("min_d", "DATE", pd.to_datetime(start_date).date()),
-                bigquery.ScalarQueryParameter("max_d", "DATE", pd.to_datetime(end_date).date()),
-            ]
+    Prints counts/lists for SKUs, Stores, Brands and returns (skus, stores, brands).
+    If stores == [], treats as ALL STORES (doesn't filter by store_id in brand check).
+    Skips nothing by itself; caller decides based on len(brands).
+    """
+    skus = _clean_list(sku_list)
+    stores = _clean_list(store_list)
+
+    min_d = pd.to_datetime(start_date).date()
+    max_d = pd.to_datetime(end_date).date()
+
+    # ---- Brands in scope (store filter only if stores were given) ----
+    if stores:
+        sql_brands = f"""
+        WITH skus AS (
+          SELECT DISTINCT id FROM UNNEST(@sku_ids) id
+          WHERE id IS NOT NULL AND TRIM(id) <> ''
         ),
-    )
-    brands = job.result().to_dataframe()["BrandDescription"].astype(str).tolist()
-
-    # 3) Print / log
-    print(f"[Preflight] SKUs ({len(skus)}):")
-    if print_full or len(skus) <= 200:
-        print(skus)
+        stores AS (
+          SELECT DISTINCT CAST(id AS STRING) AS id
+          FROM UNNEST(@store_ids) id
+          WHERE id IS NOT NULL AND TRIM(CAST(id AS STRING)) <> ''
+        )
+        SELECT DISTINCT BrandDescription
+        FROM `{base_table_fq}`
+        WHERE week_start BETWEEN @min_d AND @max_d
+          AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
+          AND CAST(store_id  AS STRING)  IN (SELECT id FROM stores)
+          AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
+        ORDER BY BrandDescription
+        """
+        params = [
+            bigquery.ArrayQueryParameter("sku_ids", "STRING", skus),
+            bigquery.ArrayQueryParameter("store_ids", "STRING", stores),
+            bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
+            bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
+        ]
     else:
-        print(skus[:200], f"...(+{len(skus)-200} more)")
+        sql_brands = f"""
+        WITH skus AS (
+          SELECT DISTINCT id FROM UNNEST(@sku_ids) id
+          WHERE id IS NOT NULL AND TRIM(id) <> ''
+        )
+        SELECT DISTINCT BrandDescription
+        FROM `{base_table_fq}`
+        WHERE week_start BETWEEN @min_d AND @max_d
+          AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
+          AND BrandDescription IS NOT NULL AND TRIM(BrandDescription) <> ''
+        ORDER BY BrandDescription
+        """
+        params = [
+            bigquery.ArrayQueryParameter("sku_ids", "STRING", skus),
+            bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
+            bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
+        ]
 
-    print(f"[Preflight] Stores ({len(stores)}):")
-    if print_full or len(stores) <= 200:
-        print(stores)
+    brands_df = client.query(sql_brands, job_config=bigquery.QueryJobConfig(query_parameters=params)).result().to_dataframe()
+    brands = brands_df["BrandDescription"].astype(str).tolist()
+
+    # ---- Diagnostics (print counts + truncated lists) ----
+    def _print_list(label, items):
+        n = len(items)
+        head = items if print_full or n <= 200 else (items[:200] + [f"...(+{n-200} more)"])
+        print(f"[Preflight] {label} ({n}): {head}")
+
+    _print_list("SKUs", skus)
+
+    if stores:
+        _print_list("Stores", stores)
     else:
-        print(stores[:200], f"...(+{len(stores)-200} more)")
+        # ALL STORES: estimate count quickly (filter by SKUs for relevance)
+        sql_store_count = f"""
+        WITH skus AS (
+          SELECT DISTINCT id FROM UNNEST(@sku_ids) id
+          WHERE id IS NOT NULL AND TRIM(id) <> ''
+        )
+        SELECT COUNT(DISTINCT CAST(store_id AS STRING)) AS n_stores
+        FROM `{base_table_fq}`
+        WHERE week_start BETWEEN @min_d AND @max_d
+          AND CAST(article_id AS STRING) IN (SELECT id FROM skus)
+        """
+        sc_params = [
+            bigquery.ArrayQueryParameter("sku_ids", "STRING", skus),
+            bigquery.ScalarQueryParameter("min_d", "DATE", min_d),
+            bigquery.ScalarQueryParameter("max_d", "DATE", max_d),
+        ]
+        n_stores = int(client.query(sql_store_count, job_config=bigquery.QueryJobConfig(query_parameters=sc_params)).result().to_dataframe()["n_stores"].iloc[0] or 0)
+        print(f"[Preflight] Stores (ALL STORES): ~{n_stores}")
 
-    print(f"[Preflight] Brands ({len(brands)}):")
-    if print_full or len(brands) <= 200:
-        print(brands)
-    else:
-        print(brands[:200], f"...(+{len(brands)-200} more)")
-
-    # Also persist to disk for forensic debugging
-    with open(os.path.join(log_dir, f"scope_{tstamp}.json"), "w") as f:
-        json.dump({"skus": skus, "stores": stores, "brands": brands}, f, indent=2)
-
-    # 4) Optional: Dry-run bytes on the main query (replace with your actual SQL builder)
-    # cfg = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False, query_parameters=[...])
-    # job = client.query(main_sql, job_config=cfg)
-    # print(f"[Preflight] Estimated bytes processed: {job.total_bytes_processed:,}")
+    _print_list("Brands", brands)
 
     return skus, stores, brands
 
@@ -621,12 +651,28 @@ def run_pipeline(
             continue
 
         # product dimension for registry
-        product_dim = (tx_slice.rename(columns={
-            "product_number":"product_id",
-            "BrandDescription":"brand",
-            "CategoryDescription":"category",
-            "SubCategoryDescription":"subcategory"
-        })[["product_id","brand","category","subcategory"]].drop_duplicates())
+        cols = set(tx_slice.columns)
+        renames = {}
+
+        def pick(candidates, canonical):
+            for c in candidates:
+                if c in cols:
+                    renames[c] = canonical
+                    return
+
+        pick(["product_id", "product_number", "article_id", "Article", "ProductNumber"], "product_id")
+        pick(["brand", "BrandDescription", "brand_description"], "brand")
+        pick(["category", "CategoryDescription", "category_description"], "category")
+        pick(["subcategory", "SubCategoryDescription", "Sub_CategoryDescription", "subcategory_description"], "subcategory")
+
+        tx_norm = tx_slice.rename(columns=renames).copy()
+
+        # Ensure all needed columns exist (fill missing with NA so downstream code can decide how to handle)
+        for need in ["product_id", "brand", "category", "subcategory"]:
+            if need not in tx_norm.columns:
+                tx_norm[need] = pd.NA
+
+        product_dim = tx_norm[["product_id", "brand", "category", "subcategory"]].drop_duplicates()
         registry = _make_registry(promo_skus, product_dim)
 
         # training cutoff
@@ -668,64 +714,71 @@ def run_pipeline(
         print("Top bottlenecks (avg seconds):")
         print(stage_avg.head(10).to_string(index=False))
 
+# safe tqdm
+try:
+    from tqdm.auto import tqdm as _tqdm
+    HAS_TQDM = True
+except Exception:
+    _tqdm = None
+    HAS_TQDM = False
+
+# default EXOG (kept if user didn't define EXOG elsewhere)
+DEFAULT_EXOG = [
+    "discountpercent",
+    "max_internal_competitor_discount_percent",
+    "n_competitors", "n_any_cheaper", "n_shelf_cheaper",
+    "n_promo_cheaper_no_hurdle", "n_promo_cheaper_hurdle",
+    "avg_cheaper_gap", "worst_gap", "p90_gap",
+    "brochure_Not on brochure", "multibuy_Not on Multibuy",
+]
+
 def run_pipeline2(
     *,
     media: pd.DataFrame,
-    tx_table: Optional[str],
-    tx_parquet: Optional[str],
-    project: Optional[str],
+    tx_table: str | None,
+    tx_parquet: str | None,
+    project: str | None,
     outdir: str,
     metrics: List[str],
     grains: List[str],
 ) -> Dict[str, pd.DataFrame]:
     """
-    Orchestrates per-campaign slicing + forecasting with:
-      - 'brand' treated as brand_subcategory
-      - only 'sku' and 'brand_subcategory' grains honored
-      - campaigns skipped unless promo SKUs belong to exactly one brand
-      - NO whole-category / whole-subcategory modeling anywhere
-
-    Side effects:
-      - Writes d_outputs/.../artifacts per campaign
-      - Writes progress CSVs in `outdir`
-
-    Returns:
-      {
-        "progress": <DataFrame of per-campaign durations>,
-        "stages":   <DataFrame of average seconds per stage>
-      }
+    Per-campaign orchestration with:
+      • Preflight diagnostics (SKUs / Stores / Brands) and brand guard (exactly 1).
+      • Cohort-level totals (no store_id in forecasting path).
+      • Parquet path preserved (lazy import).
+      • Grains normalized ('brand' -> 'brand_subcategory'; only sku/brand_subcategory modeled).
+      • NEW: if calendar is empty (ALL STORES), synthesize campaign-week keys from media dates.
     """
-    import os, time
-    from collections import defaultdict
-    import pandas as pd
-    from google.cloud import bigquery
+    # Resolve EXOG list
+    try:
+        EXOG  # may be defined elsewhere
+    except NameError:
+        EXOG = DEFAULT_EXOG
 
-    # Ensure output dirs exist
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(os.path.join(outdir, "artifacts"), exist_ok=True)
 
+    bq_client = None
     tx_master_df = None
     product_dim_df = None
-    bq_client = None
-    ranked_table = None
 
     print("run_pipeline2 setup...", end=" ", flush=True)
     if tx_table:
         bq_client = bigquery.Client(project=project)
-        parts = tx_table.split(".")
-        ranked_table = ".".join(parts[:-1] + [parts[-1].replace("_pn2", "_ranked")])
     else:
-        # Parquet fallback (rare)
+        if not tx_parquet:
+            raise ValueError("Provide either tx_table (BigQuery) or tx_parquet path.")
         tx_master_df = (pd.read_parquet(tx_parquet) if tx_parquet.endswith(".parquet")
                         else pd.read_csv(tx_parquet, parse_dates=["week_start"]))
         product_dim_df = tx_master_df[[
             "product_number","article_id",
             "BrandDescription","CategoryDescription","SubCategoryDescription"
         ]].drop_duplicates()
-    print("Done!")
+    print("Done.")
 
-    # ---- sanitize grains: only sku and brand_subcategory ----
-    cleaned_grains = []
+    # ---- sanitize grains
+    cleaned_grains: List[str] = []
     for g in (grains or []):
         g = g.strip().lower()
         if g == "brand":
@@ -735,84 +788,108 @@ def run_pipeline2(
     if not cleaned_grains:
         cleaned_grains = ["sku","brand_subcategory"]
 
+    bookings = sorted(media["booking_number"].astype(str).unique().tolist())
+    iterator = _tqdm(bookings, total=len(bookings), dynamic_ncols=True) if HAS_TQDM else bookings
+
+    from src.ri.get_data.media.parse_media_table import to_list_flexible
+    from src.ri.get_data.media.build_weekly_store_calendar import (
+        build_weekly_store_calendar_for_campaign,
+        weeks_to_store_sets,
+    )
+    from src.ri.model.orchestration.build_grids_v3 import _make_registry
+    from src.ri.model.forecasting.cohort_forecasting import forecast_per_week_dynamic_cohorts
+
     t0_all = time.time()
     per_stage: Dict[str, List[float]] = defaultdict(list)
     rows_prog: List[Dict[str, object]] = []
 
-    bookings = sorted(media["booking_number"].astype(str).unique().tolist())
-    iterator = tqdm(bookings, total=len(bookings), dynamic_ncols=True) if tqdm else bookings
-
     for i, cid in enumerate(iterator, 1):
-        print(f"booking_number {cid}")
-
+        print(f"\nbooking_number {cid}")
         t0 = time.time()
+
         mezzo = media[media["booking_number"].astype(str) == cid].copy()
         if mezzo.empty:
             continue
 
-        # promo SKUs (article ids) straight from media
-        from src.ri.get_data.media.parse_media_table import to_list_flexible
+        # ---- promo SKUs from media
         promo_skus = sorted({s for row in mezzo["sorted_sku_list"].dropna() for s in to_list_flexible(row)})
         if not promo_skus:
+            print(f"[Skip] booking {cid}: no promo SKUs found")
             continue
 
-        # fleet/all-stores handling
+        # ---- dynamic cohorts (empty list => ALL STORES)
         t_cal = time.time()
         raw = mezzo["sorted_store_list"].explode().dropna().tolist() if "sorted_store_list" in mezzo.columns else []
         fleet_input = [str(x).strip() for x in raw if str(x).strip()]
-        if not fleet_input:
-            if tx_master_df is not None:
-                fleet_input = sorted(tx_master_df["store_id"].astype(str).unique().tolist())
-            elif bq_client is not None:
-                fleet_sql = f"SELECT DISTINCT CAST(store_id AS STRING) AS sid FROM `{tx_table}`"
-                fleet_input = bq_client.query(fleet_sql).result().to_dataframe()["sid"].astype(str).tolist()
-
-        print("Building weekly store calendar...", end=" ", flush=True)
-        from src.ri.get_data.media.build_weekly_store_calendar import (
-            build_weekly_store_calendar_for_campaign,
-            weeks_to_store_sets,
-        )
         cal = build_weekly_store_calendar_for_campaign(mezzo, fleet_input)
+        print(f"{cid} Calendar: ")
+        print(cal)
         wk_to_stores = weeks_to_store_sets(cal)
-
-        # empty dict or per-week None => interpret as "all stores"
-        if not wk_to_stores:
-            stores_union = []  # empty => all stores downstream
-        else:
-            stores_union = sorted({sid for s in wk_to_stores.values() for sid in (s or [])})
+        print("wk_to_stores")
+        print(wk_to_stores)
         per_stage["calendar"].append(time.time() - t_cal)
-        print("Done!")
 
-        # window (13m back + 2w pad)
+        # ---- media window (weekly aligned)
         min_start = pd.to_datetime(mezzo["media_start_date"]).min()
         max_end   = pd.to_datetime(mezzo["media_end_date"]).max()
-        min_d = (min_start - pd.Timedelta(weeks=104)).to_period("W-WED").start_time
+        # campaign weeks (inclusive)
+        print(f"Campaign Start: {min_start}")
+        print(f"Campaign End: {max_end}")
+        start_w = pd.Period(min_start, freq="W-WED").start_time
+        end_w   = pd.Period(max_end,   freq="W-WED").start_time
+        campaign_weeks = list(pd.period_range(start=start_w, end=end_w, freq="W-WED").start_time)
+        print(f"Campaign Weeks: {campaign_weeks}")
+        # NEW: if no per-week store sets (ALL STORES), synthesize a week→None mapping
+        if not wk_to_stores:
+            wk_to_stores = {wk: None for wk in campaign_weeks}
+            stores_union = []  # all stores in SQL
+            print(f"[Calendar] ALL STORES; synthesized {len(campaign_weeks)} campaign weeks from media dates.")
+        else:
+            stores_union = sorted({sid for s in wk_to_stores.values() for sid in (s or [])})
+
+        # ---- 13m lookback + 2w pad (data pull window)
+        min_d = (min_start - pd.DateOffset(months=13)).to_period("W-WED").start_time
         max_d = (max_end   + pd.Timedelta(weeks=2)).to_period("W-WED").start_time
 
-        # fetch campaign slice
+        # ---- PREFLIGHT (prints + brand guard)
+        if bq_client is not None:
+            skus_pf, stores_pf, brands_pf = preflight_scope(
+                client=bq_client,
+                base_table_fq=tx_table,
+                sku_list=promo_skus,
+                store_list=stores_union,   # [] => ALL STORES
+                start_date=min_d,
+                end_date=max_d,
+                print_full=True,
+            )
+            n_brands = len(brands_pf)
+            if n_brands != 1:
+                print(f"[Skip] booking {cid}: promo SKUs span {n_brands} brands: {brands_pf}")
+                continue
+
+        # ---------- Fetch campaign slice (COHORT TOTALS on BQ; legacy parquet preserved) ----------
         t_fetch = time.time()
         if bq_client is not None:
-            print("Entering fetch_campaign_tx_slice_bq2...", end=" ", flush=True)
-            try:
-                tx_slice = fetch_campaign_tx_slice_bq2(
-                    client=bq_client,
-                    tx_table_fq=tx_table,
-                    ranked_table_fq=ranked_table,
-                    promo_skus_article_ids=promo_skus,
-                    stores_union=stores_union,          # [] => all stores
-                    min_date=min_d, max_date=max_d,
-                    grains=cleaned_grains,              # ONLY sku/brand_subcategory
-                )
-            except ValueError as e:
-                msg = str(e)
-                if msg.startswith("[SkipCampaign]"):
-                    print(f"\n[Skip] booking {cid}: {msg}")
-                    per_stage["fetch_slice"].append(time.time() - t_fetch)
-                    continue
-                raise
+            from src.ri.get_data.transaction_pipeline import get_transaction_data_by_scope_fast2_cohort_total
+            tx_slice = get_transaction_data_by_scope_fast2_cohort_total(
+                client=bq_client,
+                base_table_fq=tx_table,
+                sku_list=promo_skus,
+                store_list=stores_union,  # [] => all stores (cohort = whole fleet)
+                start_date=min_d, end_date=max_d,
+            )
+            tx_slice_snippet = tx_slice.head(10)
+            print("Transactions Snippet")
+            print(tx_slice_snippet)
         else:
-            # Parquet branch
-            tx_slice = fetch_campaign_tx_slice_parquet(
+            try:
+                from src.ri.get_data.transaction_pipeline import fetch_campaign_tx_slice_parquet as _fetch_parquet
+            except Exception as e:
+                raise ImportError(
+                    "Parquet path requested but 'fetch_campaign_tx_slice_parquet' is not available in "
+                    "src.ri.get_data.transaction_pipeline. Provide tx_table (BQ) or implement the helper."
+                ) from e
+            tx_slice = _fetch_parquet(
                 tx_master_df=tx_master_df,
                 product_dim_df=product_dim_df,
                 promo_skus_article_ids=promo_skus,
@@ -821,43 +898,78 @@ def run_pipeline2(
             )
         per_stage["fetch_slice"].append(time.time() - t_fetch)
         if tx_slice.empty:
+            print(f"[Skip] booking {cid}: tx_slice empty")
             continue
 
-        # product dimension for registry
-        product_dim = (tx_slice.rename(columns={
-            "product_number":"product_id",
-            "BrandDescription":"brand",
-            "CategoryDescription":"category",
-            "SubCategoryDescription":"subcategory"
-        })[["product_id","brand","category","subcategory"]].drop_duplicates())
+        # ---------- Canonicalize columns ----------
+        cols = set(tx_slice.columns)
+        renames = {}
+        def pick(cands, canonical):
+            for c in cands:
+                if c in cols:
+                    renames[c] = canonical; return
+        pick(["product_id","product_number","article_id","Article","ProductNumber"], "product_id")
+        pick(["brand","BrandDescription","brand_description"], "brand")
+        pick(["category","CategoryDescription","category_description"], "category")
+        pick(["subcategory","SubCategoryDescription","Sub_CategoryDescription","subcategory_description"], "subcategory")
+        tx_norm = tx_slice.rename(columns=renames).copy()
+        tx_norm_snippet = tx_norm.head(10)
+        print("Transactions Normalised")
+        print(tx_norm_snippet)
+        for need in ["product_id","brand","category","subcategory"]:
+            if need not in tx_norm.columns:
+                tx_norm[need] = pd.NA
 
-        from src.ri.model.orchestration.build_grids_v3 import _make_registry
+        # ---------- Registry (synthesize product_dim if cohort removed product_id) ----------
+        if tx_norm["product_id"].isna().all():
+            b = tx_norm["brand"].dropna().iloc[0] if tx_norm["brand"].notna().any() else None
+            c = tx_norm["category"].dropna().iloc[0] if tx_norm["category"].notna().any() else None
+            s = tx_norm["subcategory"].dropna().iloc[0] if tx_norm["subcategory"].notna().any() else None
+            product_dim = pd.DataFrame({
+                "product_id": promo_skus,
+                "brand": [b]*len(promo_skus),
+                "category": [c]*len(promo_skus),
+                "subcategory": [s]*len(promo_skus),
+            })
+            print(product_dim.head(5))
+        else:
+            product_dim = tx_norm[["product_id","brand","category","subcategory"]].drop_duplicates()
+
         registry = _make_registry(promo_skus, product_dim)
-
-        # training cutoff
+        print("Registry: ")
+        print(registry)
+        # ---------- Training cutoff ----------
         train_end = (pd.to_datetime(mezzo["media_start_date"]).min() - pd.Timedelta(days=1))
-
-        # forecast — only metrics in ALL_TARGETS (no category/subcategory totals anywhere)
-        full_metrics = ["sales","shoppers","new_to_sku_sales","new_to_sku_shoppers",
-                        "new_to_brand_sales","new_to_brand_shoppers"]
+        print("Train End: ")
+        print(train_end)
+        # ---------- Targets ----------
+        full_metrics = [
+            "sales","shoppers",
+            "new_to_sku_sales","new_to_sku_shoppers",
+            "new_to_brand_sales","new_to_brand_shoppers",
+        ]
         targets = (metrics if metrics != ["all"] else full_metrics)
-
+        print("Targets: ")
+        print(targets)
+        # ---------- Forecast (use tx_norm!) ----------
         for tgt in targets:
             for grain in cleaned_grains:
+                print(f"Target: {tgt}, Grain: {grain}")
                 nodes = registry.get(grain, [])
                 if not nodes:
+                    print("!!!! No nodes!")
                     continue
-
-                from src.ri.model.forecasting.cohort_forecasting import forecast_per_week_dynamic_cohorts
                 t_fc = time.time()
                 cmp_df = forecast_per_week_dynamic_cohorts(
-                    tx_master_df=tx_slice,
-                    week_to_storelist=wk_to_stores,
+                    tx_master_df=tx_norm,
+                    week_to_storelist=wk_to_stores,  # now guaranteed to have campaign week keys
                     nodes=nodes,
                     train_end_date=train_end,
                     target=tgt,
                     exog_regressors=EXOG
                 )
+                print("cmp_df: ")
+                print(cmp_df.head(5))
                 out_dir = os.path.join(outdir, "artifacts", cid)
                 os.makedirs(out_dir, exist_ok=True)
                 cmp_df.to_parquet(os.path.join(out_dir, f"compare_{tgt}_{grain}.parquet"), index=False)
@@ -865,26 +977,23 @@ def run_pipeline2(
 
         dur = time.time() - t0
         rows_prog.append({"campaign_id": cid, "seconds_total": round(dur,2)})
-        if tqdm:
+        if HAS_TQDM:
             avg = (time.time() - t0_all) / max(1,i)
             remain = (len(bookings) - i) * avg
             iterator.set_postfix_str(f"{dur/60:.1f}m | avg {avg/60:.1f}m/c | ~rem {remain/60:.1f}m")
 
-    # progress/bottlenecks
+    # ---------- Progress / bottlenecks ----------
     progress_df = pd.DataFrame(rows_prog)
-    progress_path = os.path.join(outdir, "progress_campaigns.csv")
-    progress_df.to_csv(progress_path, index=False)
+    pd.DataFrame(rows_prog).to_csv(os.path.join(outdir, "progress_campaigns.csv"), index=False)
 
     stage_rows = [{"stage":k, "avg_seconds": (sum(v)/len(v)), "n": len(v)} for k,v in per_stage.items() if v]
     stages_df = pd.DataFrame(stage_rows).sort_values("avg_seconds", ascending=False) if stage_rows else pd.DataFrame(columns=["stage","avg_seconds","n"])
-    stages_path = os.path.join(outdir, "progress_stages.csv")
-    stages_df.to_csv(stages_path, index=False)
+    stages_df.to_csv(os.path.join(outdir, "progress_stages.csv"), index=False)
 
-    if tqdm and not stages_df.empty:
+    if HAS_TQDM and not stages_df.empty:
         print("Top bottlenecks (avg seconds):")
         print(stages_df.head(10).to_string(index=False))
 
-    # Return a summary so notebook callers can inspect without reading CSVs
     return {"progress": progress_df, "stages": stages_df}
 
 
